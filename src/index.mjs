@@ -2,32 +2,63 @@ import http from "node:http";
 import OpenAI from "openai";
 import { chromium } from "playwright";
 
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
-const DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1";
-const DEEPSEEK_MODEL = "deepseek-chat";
-const HOSTNAME = "0.0.0.0";
-const PORT = 3000;
+/**
+ * @typedef {Object} Product
+ * @property {string} title
+ * @property {number} price
+ * @property {boolean} rating
+ */
 
-const TARGET_BASE_URL = "https://books.toscrape.com";
-
-const ai = new OpenAI({
-  apiKey: DEEPSEEK_API_KEY,
-  baseURL: DEEPSEEK_BASE_URL,
-});
-
-async function extractDataWithAI(htmlContent, schema) {
+/**
+ * @typedef {Object} ExtractProductReturn
+ * @property {Product[]} products
+ *
+ * @param {OpenAI} aiSDK
+ * @param {string} htmlContent
+ * @returns {Promise<ExtractProductReturn>}
+ */
+async function extractProduct(aiSDK, htmlContent) {
+  const productSchema = {
+    name: "product_schema",
+    schema: {
+      type: "object",
+      properties: {
+        products: {
+          type: "array",
+          description: "A list of product objects.",
+          items: {
+            type: "object",
+            properties: {
+              title: {
+                type: "string",
+                description: "The product title.",
+              },
+              price: {
+                type: "string",
+                description: "The product's price.",
+              },
+              rating: {
+                type: "integer",
+                description: "The product's rating.",
+              },
+            },
+          },
+        },
+      },
+    },
+  };
   const prompt = `
     You are an expert data extraction bot. Your task is to extract structured data from the provided HTML content.
-    Extract information about each book listed on the page. The data should strictly follow this JSON schema:
-    ${JSON.stringify(schema, null, 2)}
+    Extract information about each product listed on the page. The data should strictly follow this JSON schema:
+    ${JSON.stringify(productSchema, null, 2)}
     
-    The output must be a JSON array of objects, where each object represents a book.
+    The output must be a JSON array of objects, where each object represents a product.
     
     HTML content:
     ${htmlContent}
     `;
 
-  const completion = await ai.chat.completions.create({
+  const completion = await aiSDK.chat.completions.create({
     model: DEEPSEEK_MODEL,
     messages: [{ role: "user", content: prompt }],
     response_format: { type: "json_object" },
@@ -38,96 +69,127 @@ async function extractDataWithAI(htmlContent, schema) {
   return extractedData;
 }
 
-async function extractPageContent(url) {
-  const browser = await chromium.launch();
-  const page = await browser.newPage();
+/**
+ * @param {string} url
+ * @param {import('playwright').Page} page
+ * @returns {Promise<string[]>}
+ */
+async function getPaginationLinks(url, page) {
+  const links = await page.$$eval('nav[role="navigation"] ol a', (anchors) => {
+    return anchors.map((a) => {
+      return a.href;
+    });
+  });
 
-  await page.goto(url, { waitUntil: "domcontentloaded" });
-  const pageContent = await page.content();
-
-  await browser.close();
-  return pageContent;
+  return links
+    .filter((link) => {
+      // Make sure to return the link to in the same website
+      return new URL(link).hostname === new URL(url).hostname;
+    })
+    .map((link) => {
+      // Move the pagination always in the end of query string
+      const url = new URL(link);
+      const params = url.searchParams;
+      const pgnValue = params.get("_pgn");
+      params.delete("_pgn");
+      params.append("_pgn", pgnValue);
+      return url.toString();
+    });
 }
 
-async function crawlAndExtract() {
-  const startUrl = `${TARGET_BASE_URL}/`;
+/**
+ * @param {import('playwright').Page} page
+ * @returns {Promise<string[]>}
+ */
+async function getResultItems(page) {
+  const result = await page.$$eval("#srp-river-results li", (nodes) => {
+    return nodes.map((node) => {
+      return node.outerHTML;
+    });
+  });
+  return result;
+}
+
+/**
+ * @param {OpenAI} aiSDK
+ * @param {import('playwright').Page} page
+ * @param {number} maxPage
+ * @returns {Promise<Product[]>}
+ */
+async function crawlAndExtract(aiSDK, page, maxPage) {
+  const startUrl = TARGET_BASE_URL;
   const visitedUrls = new Set();
   const toVisitUrls = [startUrl];
-  const allBookData = [];
+  const allProductData = [];
 
-  // while (toVisitUrls.length > 0 && visitedUrls.size < 20) {
-  const currentUrl = toVisitUrls.shift();
+  // Batch per 25 items to prevenet error max token limit in the LLM
+  /**
+   * @type {string[]}
+   */
+  const bathces = [];
+  const itemsPerBatch = 25;
 
-  // if (visitedUrls.has(currentUrl)) {
-  //   continue;
-  // }
+  // Get all items
+  while (toVisitUrls.length > 0 && visitedUrls.size < maxPage) {
+    const currentUrl = toVisitUrls.shift();
+    if (visitedUrls.has(currentUrl)) {
+      continue;
+    }
 
-  console.log(`Crawling: ${currentUrl}`);
-  visitedUrls.add(currentUrl);
+    console.log(`Crawling: ${currentUrl}`);
+    visitedUrls.add(currentUrl);
 
-  const pageContent = await extractPageContent(currentUrl);
+    await page.goto(currentUrl, { waitUntil: "domcontentloaded" });
+    const paginationLinks = await getPaginationLinks(currentUrl, page);
+    for (const paginationLink of paginationLinks) {
+      if (!visitedUrls.has(paginationLink)) {
+        toVisitUrls.push(paginationLink);
+      }
+    }
 
-  console.log(`Extracting data from: ${currentUrl}`);
-  const bookSchema = {
-    name: "book_schema",
-    schema: {
-      type: "object",
-      properties: {
-        books: {
-          type: "array",
-          description: "A list of book objects.",
-          items: {
-            type: "object",
-            properties: {
-              title: {
-                type: "string",
-                description: "The book title.",
-              },
-              price: {
-                type: "string",
-                description: "The book's price.",
-              },
-              rating: {
-                type: "integer",
-                description: "The book's rating.",
-              },
-            },
-          },
-        },
-      },
-    },
-  };
-
-  const extractedData = await extractDataWithAI(pageContent, bookSchema);
-
-  if (
-    typeof extractedData === "object" &&
-    "books" in extractedData &&
-    Array.isArray(extractedData.books)
-  ) {
-    allBookData.push(...extractedData.books);
+    const resultItems = await getResultItems(page);
+    for (let i = 0; i < resultItems.length; i += itemsPerBatch) {
+      bathces.push(resultItems.slice(i, itemsPerBatch));
+    }
   }
 
-  // const links = await page.$$eval("a", (anchors) =>
-  //   anchors.map((a) => a.href)
-  // );
-  // links.forEach((link) => {
-  //   try {
-  //     const absoluteUrl = new URL(link, currentUrl).href;
-  //     if (
-  //       new URL(absoluteUrl).hostname === new URL(startUrl).hostname &&
-  //       !visitedUrls.has(absoluteUrl)
-  //     ) {
-  //       toVisitUrls.push(absoluteUrl);
-  //     }
-  //   } catch (e) {
-  //     console.error(`Invalid link ${link}: ${error.message}`);
-  //   }
-  // });
+  while (bathces.length > 0) {
+    const batch = bathces.shift();
+  }
+
+  console.log(batched);
+
+  // console.log(`Extracting data from: ${currentUrl}`);
+  // const extractedData = await extractProduct(aiSDK, pageContent);
+
+  // if (
+  //   typeof extractedData === "object" &&
+  //   "products" in extractedData &&
+  //   Array.isArray(extractedData.products)
+  // ) {
+  //   allProductData.push(...extractedData.products);
+  // }
 
   console.log(`${currentUrl}: Data successfully extracted.`);
-  return allBookData;
+  return allProductData;
 }
+
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+const DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1";
+const DEEPSEEK_MODEL = "deepseek-chat";
+const HOSTNAME = "0.0.0.0";
+const PORT = 3000;
+
+const TARGET_BASE_URL =
+  "https://www.ebay.com/sch/i.html?_from=R40&_nkw=nike&_sacat=0&rt=nc&_ipg=240&_pgn=1";
+
+const ai = new OpenAI({
+  apiKey: DEEPSEEK_API_KEY,
+  baseURL: DEEPSEEK_BASE_URL,
+});
+
+const browser = await chromium.launch();
+const page = await browser.newPage();
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(`http://${req.headers.host}${req.url}`);
@@ -135,7 +197,8 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (pathname === "/scape") {
-      const scrappedData = await crawlAndExtract();
+      const maxPage = Number(url.searchParams.get("max_page")) || 2;
+      const scrappedData = await crawlAndExtract(ai, page, maxPage);
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(scrappedData));
@@ -147,6 +210,7 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ message: "Not Found." }));
     }
   } catch (error) {
+    console.error(error);
     res.writeHead(500, { "Content-Type": "application/json" });
     res.end(JSON.stringify(error));
   }
@@ -155,3 +219,13 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOSTNAME, () => {
   console.log(`Server running at http://${HOSTNAME}:${PORT}`);
 });
+
+async function gracefulShutdown() {
+  console.log("Preparing to shutdown...");
+  await browser.close();
+  console.log("Shutdown successfully.");
+  process.exit(0);
+}
+
+process.on("SIGTERM", gracefulShutdown);
+process.on("SIGINT", gracefulShutdown);
