@@ -1,12 +1,12 @@
 import http from "node:http";
 import OpenAI from "openai";
-import { chromium } from "playwright";
+import { firefox } from "playwright";
 
 /**
  * @typedef {Object} Product
  * @property {string} title
  * @property {number} price
- * @property {boolean} rating
+ * @property {string} description
  */
 
 /**
@@ -37,9 +37,9 @@ async function extractProduct(aiSDK, htmlContent) {
                 type: "string",
                 description: "The product's price.",
               },
-              rating: {
-                type: "integer",
-                description: "The product's rating.",
+              description: {
+                type: "string",
+                description: "The product's description.",
               },
             },
           },
@@ -49,7 +49,8 @@ async function extractProduct(aiSDK, htmlContent) {
   };
   const prompt = `
     You are an expert data extraction bot. Your task is to extract structured data from the provided HTML content.
-    Extract information about each product listed on the page. The data should strictly follow this JSON schema:
+    Extract information about each product listed on the page. When the information not available just fill it with dash (-)
+    The data should strictly follow this JSON schema:
     ${JSON.stringify(productSchema, null, 2)}
     
     The output must be a JSON array of objects, where each object represents a product.
@@ -59,7 +60,7 @@ async function extractProduct(aiSDK, htmlContent) {
     `;
 
   const completion = await aiSDK.chat.completions.create({
-    model: DEEPSEEK_MODEL,
+    model: "deepseek-chat",
     messages: [{ role: "user", content: prompt }],
     response_format: { type: "json_object" },
   });
@@ -70,11 +71,20 @@ async function extractProduct(aiSDK, htmlContent) {
 }
 
 /**
- * @param {string} url
  * @param {import('playwright').Page} page
+ * @param {string} link
+ */
+async function awaitSplashUI(page, link) {
+  const pageUrl = new URL(link);
+  await page.waitForURL(`**\/${pageUrl.pathname.substring(1)}**`);
+}
+
+/**
+ * @param {import('playwright').Page} page
+ * @param {string} url
  * @returns {Promise<string[]>}
  */
-async function getPaginationLinks(url, page) {
+async function getPaginationLinks(page, url) {
   const links = await page.$$eval('nav[role="navigation"] ol a', (anchors) => {
     return anchors.map((a) => {
       return a.href;
@@ -98,33 +108,71 @@ async function getPaginationLinks(url, page) {
 }
 
 /**
- * @param {import('playwright').Page} page
- * @returns {Promise<string[]>}
+ * @typedef {Object} ProductItem
+ * @property {string} productId
+ * @property {string} productItemHtml
+ * @property {string} productDetailHtml
+ * @property {string} detailLink
  */
-async function getResultItems(page) {
+
+/**
+ * @param {import('playwright').Page} page
+ * @returns {Promise<ProductItem[]>}
+ */
+async function getProductItems(page) {
   const result = await page.$$eval("#srp-river-results li", (nodes) => {
     return nodes.map((node) => {
-      return node.outerHTML;
+      const detailLink = node.querySelector("a").href;
+      const productId = new URL(detailLink).pathname.replace("/itm/", "");
+      /**
+       * @type {ProductItem}
+       */
+      const productItem = {
+        productId,
+        detailLink,
+        productItemHtml: node.outerHTML,
+        productDetailHtml: "",
+      };
+      return productItem;
     });
   });
   return result;
 }
 
 /**
+ * @param {import('playwright').Page} page
+ * @returns {Promise<string[]>}
+ */
+async function getProductDescription(page) {
+  const result = await page.$$eval(
+    "div[data-testid=d-tabs] div[data-testid=d-vi-evo-region]",
+    (nodes) => {
+      return nodes.map((node) => {
+        return node.outerHTML;
+      });
+    }
+  );
+  return result;
+}
+
+/**
  * @param {OpenAI} aiSDK
  * @param {import('playwright').Page} page
+ * @param {string} startUrl
  * @param {number} maxPage
  * @returns {Promise<Product[]>}
  */
-async function crawlAndExtract(aiSDK, page, maxPage) {
-  const startUrl = TARGET_BASE_URL;
+async function crawlAndExtract(aiSDK, page, startUrl, maxPage) {
   const visitedUrls = new Set();
   const toVisitUrls = [startUrl];
+  /**
+   * @type {Product[]}
+   */
   const allProductData = [];
 
   // Batch per 25 items to prevenet error max token limit in the LLM
   /**
-   * @type {string[]}
+   * @type {ProductItem[][]}
    */
   const bathces = [];
   const itemsPerBatch = 25;
@@ -135,48 +183,128 @@ async function crawlAndExtract(aiSDK, page, maxPage) {
     if (visitedUrls.has(currentUrl)) {
       continue;
     }
-
-    console.log(`Crawling: ${currentUrl}`);
     visitedUrls.add(currentUrl);
 
-    await page.goto(currentUrl, { waitUntil: "domcontentloaded" });
-    const paginationLinks = await getPaginationLinks(currentUrl, page);
-    for (const paginationLink of paginationLinks) {
-      if (!visitedUrls.has(paginationLink)) {
-        toVisitUrls.push(paginationLink);
+    try {
+      console.log("Crawling product list at:");
+      console.log(currentUrl);
+      await page.goto(currentUrl, { waitUntil: "domcontentloaded" });
+      await awaitSplashUI(page, currentUrl);
+      console.log("Successfully crawling product list\n");
+
+      console.log("Get pagination links");
+      const paginationLinks = await getPaginationLinks(page, currentUrl);
+      for (const paginationLink of paginationLinks) {
+        if (!visitedUrls.has(paginationLink)) {
+          toVisitUrls.push(paginationLink);
+        }
+      }
+      console.log("Successfully get pagination links\n");
+
+      console.log("Extracting product list content");
+      const productItems = await getProductItems(page);
+      console.log(`Product items count: ${productItems.length}`);
+      for (let i = 0; i < productItems.length; i += itemsPerBatch) {
+        bathces.push(productItems.slice(i, i + itemsPerBatch));
+      }
+      console.log("Successfully product list content\n");
+    } catch (error) {
+      console.error(
+        `Error when visit product list ${currentUrl}: ${String(error)}`
+      );
+      continue;
+    }
+  }
+
+  for (let i = 0; i < 1; i++) {
+    const batch = bathces[i];
+    if (!batch || batch.length === 0) {
+      continue;
+    }
+
+    for (let j = 0; j < 2; j++) {
+      const batchItem = batch[j];
+      if (!batchItem) {
+        continue;
+      }
+
+      try {
+        console.log("Crawling detail page at:");
+        console.log(batchItem.productId);
+        await page.goto(batchItem.detailLink, {
+          waitUntil: "domcontentloaded",
+        });
+        await awaitSplashUI(page, batchItem.detailLink);
+        console.log("Successfully crawling detail page\n");
+
+        console.log("Extracting data from detail page");
+        batch[j].productDetailHtml = await getProductDescription(page);
+        console.log("Successfully extracting data from detail page\n");
+      } catch (error) {
+        console.error(
+          `Error when get product detail ${batchItem.productId}: ${String(
+            error
+          )}`
+        );
+        continue;
       }
     }
+  }
 
-    const resultItems = await getResultItems(page);
-    for (let i = 0; i < resultItems.length; i += itemsPerBatch) {
-      bathces.push(resultItems.slice(i, itemsPerBatch));
+  for (let i = 0; i < 1; i++) {
+    const batch = bathces[i];
+    if (!batch || batch.length === 0) {
+      continue;
+    }
+
+    /**
+     * @type {Promise<ExtractProductReturn>[]}
+     */
+    const extractProductPromises = [];
+    for (let j = 0; j < 2; j++) {
+      const batchItem = batch[j];
+      if (!batchItem) {
+        continue;
+      }
+
+      console.log(`Extracting data from product id: ${batchItem.productId}`);
+      const extractProductPromise = extractProduct(
+        aiSDK,
+        `<div>
+            <ul class="product_item">
+              ${batchItem.productItemHtml}
+            <ul>
+            <div>
+              ${batchItem.productDetailHtml}
+            </div>
+          </div>`
+      );
+
+      extractProductPromises.push(extractProductPromise);
+    }
+
+    const extractedResults = await Promise.allSettled(extractProductPromises);
+    for (const extractedResult of extractedResults) {
+      if (extractedResult.status === "rejected") {
+        continue;
+      }
+
+      if (
+        typeof extractedResult.value === "object" &&
+        "products" in extractedResult.value &&
+        Array.isArray(extractedResult.value.products)
+      ) {
+        allProductData.push(...extractedResult.value.products);
+      }
     }
   }
 
-  while (bathces.length > 0) {
-    const batch = bathces.shift();
-  }
-
-  console.log(batched);
-
-  // console.log(`Extracting data from: ${currentUrl}`);
-  // const extractedData = await extractProduct(aiSDK, pageContent);
-
-  // if (
-  //   typeof extractedData === "object" &&
-  //   "products" in extractedData &&
-  //   Array.isArray(extractedData.products)
-  // ) {
-  //   allProductData.push(...extractedData.products);
-  // }
-
-  console.log(`${currentUrl}: Data successfully extracted.`);
+  console.log(`Data successfully extracted.`);
   return allProductData;
 }
 
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1";
-const DEEPSEEK_MODEL = "deepseek-chat";
 const HOSTNAME = "0.0.0.0";
 const PORT = 3000;
 
@@ -188,8 +316,13 @@ const ai = new OpenAI({
   baseURL: DEEPSEEK_BASE_URL,
 });
 
-const browser = await chromium.launch();
-const page = await browser.newPage();
+const browser = await firefox.launch({ headless: true });
+const browserContext = await browser.newContext({
+  user_agent:
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  viewport: { width: 1920, height: 1080 },
+});
+const page = await browserContext.newPage();
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(`http://${req.headers.host}${req.url}`);
@@ -197,8 +330,13 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (pathname === "/scape") {
-      const maxPage = Number(url.searchParams.get("max_page")) || 2;
-      const scrappedData = await crawlAndExtract(ai, page, maxPage);
+      const maxPage = Number(url.searchParams.get("max_page")) || 1;
+      const scrappedData = await crawlAndExtract(
+        ai,
+        page,
+        TARGET_BASE_URL,
+        maxPage
+      );
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(scrappedData));
