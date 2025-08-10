@@ -156,29 +156,40 @@ async function getProductDescription(page) {
 }
 
 /**
+ * @typedef {Object} CrawlQuery
+ * @property {number} search
+ * @property {number} fromPage
+ * @property {number} toPage
+ *
  * @param {OpenAI} aiSDK
  * @param {import('playwright').Page} page
  * @param {string} startUrl
- * @param {number} maxPage
+ * @param {CrawlQuery} query
  * @returns {Promise<Product[]>}
  */
-async function crawlAndExtract(aiSDK, page, startUrl, maxPage) {
+async function crawlAndExtract(aiSDK, page, startUrl, query) {
+  const { search, fromPage, toPage } = query;
+
+  if (!search) {
+    return [];
+  }
+
   const visitedUrls = new Set();
-  const toVisitUrls = [startUrl];
+  const toVisitUrls = [`${startUrl}&_nkw=nike&_pgn=${fromPage}`];
   /**
    * @type {Product[]}
    */
   const allProductData = [];
 
-  // Batch per 25 items to prevenet error max token limit in the LLM
+  // Batch per 5 items to prevenet error max token limit in the LLM
   /**
    * @type {ProductItem[][]}
    */
   const bathces = [];
-  const itemsPerBatch = 25;
+  const itemsPerBatch = 5;
 
   // Get all items
-  while (toVisitUrls.length > 0 && visitedUrls.size < maxPage) {
+  while (toVisitUrls.length > 0 && visitedUrls.size < toPage) {
     const currentUrl = toVisitUrls.shift();
     if (visitedUrls.has(currentUrl)) {
       continue;
@@ -216,13 +227,13 @@ async function crawlAndExtract(aiSDK, page, startUrl, maxPage) {
     }
   }
 
-  for (let i = 0; i < 1; i++) {
+  for (let i = 0; i < bathces.length; i++) {
     const batch = bathces[i];
     if (!batch || batch.length === 0) {
       continue;
     }
 
-    for (let j = 0; j < 2; j++) {
+    for (let j = 0; j < batch.length; j++) {
       const batchItem = batch[j];
       if (!batchItem) {
         continue;
@@ -251,51 +262,51 @@ async function crawlAndExtract(aiSDK, page, startUrl, maxPage) {
     }
   }
 
-  for (let i = 0; i < 1; i++) {
+  /**
+   * @type {Promise<ExtractProductReturn>[]}
+   */
+  const extractProductPromises = [];
+  for (let i = 0; i < bathces.length; i++) {
     const batch = bathces[i];
     if (!batch || batch.length === 0) {
       continue;
     }
+    const productIds = batch.map((batchItem) => {
+      return batchItem.productId;
+    });
+    const productBatchItems = batch.map((batchItem) => {
+      return `
+        <div class="product_${batchItem.productId}">
+          <ul class="product_item">
+            ${batchItem.productItemHtml}
+          <ul>
+          <div class="product_item_detail">
+            ${batchItem.productDetailHtml}
+          </div>
+        </div>`;
+    });
+    const productBatchContent = `
+    <div class="product_list">
+      ${productBatchItems.join("")}
+    <div>`;
 
-    /**
-     * @type {Promise<ExtractProductReturn>[]}
-     */
-    const extractProductPromises = [];
-    for (let j = 0; j < 2; j++) {
-      const batchItem = batch[j];
-      if (!batchItem) {
-        continue;
-      }
+    console.log(`Extracting data from product id: ${productIds.join(", ")}`);
+    const extractProductPromise = extractProduct(aiSDK, productBatchContent);
+    extractProductPromises.push(extractProductPromise);
+  }
 
-      console.log(`Extracting data from product id: ${batchItem.productId}`);
-      const extractProductPromise = extractProduct(
-        aiSDK,
-        `<div>
-            <ul class="product_item">
-              ${batchItem.productItemHtml}
-            <ul>
-            <div>
-              ${batchItem.productDetailHtml}
-            </div>
-          </div>`
-      );
-
-      extractProductPromises.push(extractProductPromise);
+  const extractedResults = await Promise.allSettled(extractProductPromises);
+  for (const extractedResult of extractedResults) {
+    if (extractedResult.status === "rejected") {
+      continue;
     }
 
-    const extractedResults = await Promise.allSettled(extractProductPromises);
-    for (const extractedResult of extractedResults) {
-      if (extractedResult.status === "rejected") {
-        continue;
-      }
-
-      if (
-        typeof extractedResult.value === "object" &&
-        "products" in extractedResult.value &&
-        Array.isArray(extractedResult.value.products)
-      ) {
-        allProductData.push(...extractedResult.value.products);
-      }
+    if (
+      typeof extractedResult.value === "object" &&
+      "products" in extractedResult.value &&
+      Array.isArray(extractedResult.value.products)
+    ) {
+      allProductData.push(...extractedResult.value.products);
     }
   }
 
@@ -309,7 +320,7 @@ const HOSTNAME = "0.0.0.0";
 const PORT = 3000;
 
 const TARGET_BASE_URL =
-  "https://www.ebay.com/sch/i.html?_from=R40&_nkw=nike&_sacat=0&rt=nc&_ipg=240&_pgn=1";
+  "https://www.ebay.com/sch/i.html?_from=R40&_sacat=0&rt=nc&_ipg=60";
 
 const ai = new OpenAI({
   apiKey: DEEPSEEK_API_KEY,
@@ -329,14 +340,15 @@ const server = http.createServer(async (req, res) => {
   const { pathname } = url;
 
   try {
-    if (pathname === "/scape") {
-      const maxPage = Number(url.searchParams.get("max_page")) || 1;
-      const scrappedData = await crawlAndExtract(
-        ai,
-        page,
-        TARGET_BASE_URL,
-        maxPage
-      );
+    if (pathname === "/scrape") {
+      const search = url.searchParams.get("search") || "";
+      const fromPage = Number(url.searchParams.get("from_page")) || 1;
+      const toPage = Number(url.searchParams.get("to_page")) || fromPage;
+      const scrappedData = await crawlAndExtract(ai, page, TARGET_BASE_URL, {
+        search,
+        fromPage,
+        toPage,
+      });
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(scrappedData));
