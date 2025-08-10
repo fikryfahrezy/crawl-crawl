@@ -335,36 +335,86 @@ const browserContext = await browser.newContext({
 });
 const page = await browserContext.newPage();
 
-const server = http.createServer(async (req, res) => {
-  const url = new URL(`http://${req.headers.host}${req.url}`);
-  const { pathname } = url;
+function simpleRateLimitMiddleware() {
+  const requestCounts = new Map();
+  const windowMs = 60 * 1000; // 1 minute window
+  const maxRequests = 5; // Max 5 requests per minute per IP
 
-  try {
-    if (pathname === "/scrape") {
-      const search = url.searchParams.get("search") || "";
-      const fromPage = Number(url.searchParams.get("from_page")) || 1;
-      const toPage = Number(url.searchParams.get("to_page")) || fromPage;
-      const scrappedData = await crawlAndExtract(ai, page, TARGET_BASE_URL, {
-        search,
-        fromPage,
-        toPage,
-      });
+  /**
+   * @param {import("http").IncomingMessage} req
+   * @param {import("http").ServerResponse<import("http").IncomingMessage>} res
+   * @param {() => Promise<void>} next
+   */
+  const middleware = async (req, res, next) => {
+    const ip = req.socket.remoteAddress;
+    const count = requestCounts.get(ip) || 0;
 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(scrappedData));
-    } else if (pathname === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true }));
-    } else {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ message: "Not Found." }));
+    if (count >= maxRequests) {
+      res.writeHead(429, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          success: false,
+          message:
+            "Too many requests from this IP, please try again after a minute",
+        })
+      );
+      return;
     }
-  } catch (error) {
-    console.error(error);
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(error));
-  }
+
+    requestCounts.set(ip, count + 1);
+    if (count === 0) {
+      setTimeout(() => {
+        requestCounts.delete(ip);
+        console.log(`Rate limit for IP ${ip} has been reset.`);
+      }, windowMs);
+    }
+
+    await next();
+  };
+
+  return middleware;
+}
+
+const rateLimitMiddleware = simpleRateLimitMiddleware();
+const server = http.createServer(async (req, res) => {
+  const next = async () => {
+    const url = new URL(`http://${req.headers.host}${req.url}`);
+    const { pathname } = url;
+
+    try {
+      if (pathname === "/scrape") {
+        const search = url.searchParams.get("search") || "";
+        const fromPage = Number(url.searchParams.get("from_page")) || 1;
+        const toPage = Number(url.searchParams.get("to_page")) || fromPage;
+        const scrappedData = await crawlAndExtract(ai, page, TARGET_BASE_URL, {
+          search,
+          fromPage,
+          toPage,
+        });
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(scrappedData));
+      } else if (pathname === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true }));
+      } else {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ message: "Not Found." }));
+      }
+    } catch (error) {
+      console.error(error);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(error));
+    }
+  };
+
+  rateLimitMiddleware(req, res, next);
 });
+
+server.timeout = 0;
+server.keepAliveTimeout = 0;
+server.headersTimeout = 0;
+server.requestTimeout = 0;
 
 server.listen(PORT, HOSTNAME, () => {
   console.log(`Server running at http://${HOSTNAME}:${PORT}`);
