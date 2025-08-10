@@ -4,7 +4,7 @@ import { firefox } from "playwright";
 
 /**
  * @typedef {Object} Product
- * @property {string} title
+ * @property {string} name
  * @property {number} price
  * @property {string} description
  */
@@ -29,9 +29,9 @@ async function extractProduct(aiSDK, htmlContent) {
           items: {
             type: "object",
             properties: {
-              title: {
+              name: {
                 type: "string",
-                description: "The product title.",
+                description: "The product name.",
               },
               price: {
                 type: "string",
