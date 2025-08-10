@@ -87,12 +87,12 @@ Response (200):
 ```json
 [
 	{
-		"title": "Nike Air Max 2017 Triple Black Mens Sneakers Size US 7-15 Casual Shoes New✅",
+		"name": "Nike Air Max 2017 Triple Black Mens Sneakers Size US 7-15 Casual Shoes New✅",
 		"price": "$97.83",
 		"description": "New with box: A brand-new, unused, and unworn item (including handmade items) in the original packaging (such as the original box or bag) and/or with the original tags attached."
 	},
 	{
-		"title": "Nike Dunk Low Retro SE Armory Navy Gum Men Casual Shoes Sneakers HQ1931-400",
+		"name": "Nike Dunk Low Retro SE Armory Navy Gum Men Casual Shoes Sneakers HQ1931-400",
 		"price": "$119.99",
 		"description": "Brand New"
 	}
