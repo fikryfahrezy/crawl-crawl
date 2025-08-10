@@ -111,8 +111,9 @@ async function getPaginationLinks(page, url) {
  * @typedef {Object} ProductItem
  * @property {string} productId
  * @property {string} productItemHtml
- * @property {string} productDetailHtml
+ * @property {string} productDescriptionHtml
  * @property {string} detailLink
+ * @property {string} descriptionLink
  */
 
 /**
@@ -130,8 +131,9 @@ async function getProductItems(page) {
       const productItem = {
         productId,
         detailLink,
+        descriptionLink: `https://itm.ebaydesc.com/itmdesc/${productId}`,
         productItemHtml: node.outerHTML,
-        productDetailHtml: "",
+        productDescriptionHtml: "",
       };
       return productItem;
     });
@@ -141,18 +143,15 @@ async function getProductItems(page) {
 
 /**
  * @param {import('playwright').Page} page
- * @returns {Promise<string[]>}
+ * @returns {Promise<string>}
  */
 async function getProductDescription(page) {
-  const result = await page.$$eval(
-    "div[data-testid=d-tabs] div[data-testid=d-vi-evo-region]",
-    (nodes) => {
-      return nodes.map((node) => {
-        return node.outerHTML;
-      });
-    }
-  );
-  return result;
+  const result = await page.$$eval("body", (nodes) => {
+    return nodes.map((node) => {
+      return node.innerHTML;
+    });
+  });
+  return result[0] || "";
 }
 
 /**
@@ -181,12 +180,10 @@ async function crawlAndExtract(aiSDK, page, startUrl, query) {
    */
   const allProductData = [];
 
-  // Batch per 5 items to prevenet error max token limit in the LLM
   /**
-   * @type {ProductItem[][]}
+   * @type {ProductItem[]}
    */
-  const bathces = [];
-  const itemsPerBatch = 5;
+  const productItems = [];
 
   // Get all items
   while (toVisitUrls.length > 0 && visitedUrls.size < toPage) {
@@ -213,52 +210,43 @@ async function crawlAndExtract(aiSDK, page, startUrl, query) {
       console.log("Successfully get pagination links\n");
 
       console.log("Extracting product list content");
-      const productItems = await getProductItems(page);
-      console.log(`Product items count: ${productItems.length}`);
-      for (let i = 0; i < productItems.length; i += itemsPerBatch) {
-        bathces.push(productItems.slice(i, i + itemsPerBatch));
-      }
+      const productItemContents = await getProductItems(page);
+      console.log(`Product items count: ${productItemContents.length}`);
+      productItems.push(...productItemContents);
       console.log("Successfully product list content\n");
     } catch (error) {
       console.error(
         `Error when visit product list ${currentUrl}: ${String(error)}`
       );
-      continue;
     }
   }
 
-  for (let i = 0; i < bathces.length; i++) {
-    const batch = bathces[i];
-    if (!batch || batch.length === 0) {
+  for (let i = 0; i < productItems.length; i++) {
+    const productItem = productItems[i];
+    if (!productItem) {
       continue;
     }
 
-    for (let j = 0; j < batch.length; j++) {
-      const batchItem = batch[j];
-      if (!batchItem) {
-        continue;
-      }
+    try {
+      console.log("Crawling detail page at:");
+      console.log(productItem.productId);
+      await page.goto(productItem.descriptionLink, {
+        waitUntil: "domcontentloaded",
+      });
+      await awaitSplashUI(page, productItem.descriptionLink);
+      console.log("Successfully crawling detail page\n");
 
-      try {
-        console.log("Crawling detail page at:");
-        console.log(batchItem.productId);
-        await page.goto(batchItem.detailLink, {
-          waitUntil: "domcontentloaded",
-        });
-        await awaitSplashUI(page, batchItem.detailLink);
-        console.log("Successfully crawling detail page\n");
-
-        console.log("Extracting data from detail page");
-        batch[j].productDetailHtml = await getProductDescription(page);
-        console.log("Successfully extracting data from detail page\n");
-      } catch (error) {
-        console.error(
-          `Error when get product detail ${batchItem.productId}: ${String(
-            error
-          )}`
-        );
-        continue;
-      }
+      console.log("Extracting data from detail page");
+      productItems[i].productDescriptionHtml = await getProductDescription(
+        page
+      );
+      console.log("Successfully extracting data from detail page\n");
+    } catch (error) {
+      console.error(
+        `Error when get product detail ${productItem.productId}: ${String(
+          error
+        )}`
+      );
     }
   }
 
@@ -266,38 +254,32 @@ async function crawlAndExtract(aiSDK, page, startUrl, query) {
    * @type {Promise<ExtractProductReturn>[]}
    */
   const extractProductPromises = [];
-  for (let i = 0; i < bathces.length; i++) {
-    const batch = bathces[i];
-    if (!batch || batch.length === 0) {
+  for (let i = 0; i < productItems.length; i++) {
+    const productItem = productItems[i];
+    if (!productItem) {
       continue;
     }
-    const productIds = batch.map((batchItem) => {
-      return batchItem.productId;
-    });
-    const productBatchItems = batch.map((batchItem) => {
-      return `
-        <div class="product_${batchItem.productId}">
+    const productItemHtml = `
+        <div class="product_${productItem.productId}">
           <ul class="product_item">
-            ${batchItem.productItemHtml}
+            ${productItem.productItemHtml}
           <ul>
-          <div class="product_item_detail">
-            ${batchItem.productDetailHtml}
+          <div title="description" class="product_item_description">
+            ${productItem.productDescriptionHtml}
           </div>
         </div>`;
-    });
-    const productBatchContent = `
-    <div class="product_list">
-      ${productBatchItems.join("")}
-    <div>`;
 
-    console.log(`Extracting data from product id: ${productIds.join(", ")}`);
-    const extractProductPromise = extractProduct(aiSDK, productBatchContent);
+    console.log(`Extracting data from product id: ${productItem.productId}`);
+    const extractProductPromise = extractProduct(aiSDK, productItemHtml);
     extractProductPromises.push(extractProductPromise);
   }
 
   const extractedResults = await Promise.allSettled(extractProductPromises);
   for (const extractedResult of extractedResults) {
     if (extractedResult.status === "rejected") {
+      console.error(
+        `Failed to extract product data: ${extractedResult.reason}`
+      );
       continue;
     }
 
@@ -314,27 +296,6 @@ async function crawlAndExtract(aiSDK, page, startUrl, query) {
   console.log(JSON.stringify(allProductData));
   return allProductData;
 }
-
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
-const DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1";
-const HOSTNAME = "0.0.0.0";
-const PORT = 3000;
-
-const TARGET_BASE_URL =
-  "https://www.ebay.com/sch/i.html?_from=R40&_sacat=0&rt=nc&_ipg=60";
-
-const ai = new OpenAI({
-  apiKey: DEEPSEEK_API_KEY,
-  baseURL: DEEPSEEK_BASE_URL,
-});
-
-const browser = await firefox.launch({ headless: true });
-const browserContext = await browser.newContext({
-  user_agent:
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  viewport: { width: 1920, height: 1080 },
-});
-const page = await browserContext.newPage();
 
 function simpleRateLimitMiddleware() {
   const requestCounts = new Map();
@@ -376,6 +337,31 @@ function simpleRateLimitMiddleware() {
   return middleware;
 }
 
+// Use `firefox` instead of `chromium`
+// because somehow `chromium` feels like less frequent to timeout
+// when visiting the target page.
+const browser = await firefox.launch({ headless: true });
+// Mimic "real" browser
+const browserContext = await browser.newContext({
+  user_agent:
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  viewport: { width: 1920, height: 1080 },
+});
+const page = await browserContext.newPage();
+
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+const DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1";
+const HOSTNAME = "0.0.0.0";
+const PORT = 3000;
+
+const TARGET_BASE_URL =
+  "https://www.ebay.com/sch/i.html?_from=R40&_sacat=0&rt=nc&_ipg=60";
+
+const ai = new OpenAI({
+  apiKey: DEEPSEEK_API_KEY,
+  baseURL: DEEPSEEK_BASE_URL,
+});
+
 const rateLimitMiddleware = simpleRateLimitMiddleware();
 const server = http.createServer(async (req, res) => {
   const next = async () => {
@@ -412,6 +398,7 @@ const server = http.createServer(async (req, res) => {
   rateLimitMiddleware(req, res, next);
 });
 
+// Disable the timeout of the HTTP server from Node
 server.timeout = 0;
 server.keepAliveTimeout = 0;
 server.headersTimeout = 0;
