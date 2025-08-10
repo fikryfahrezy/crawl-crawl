@@ -120,7 +120,7 @@ async function getPaginationLinks(page, url) {
  * @returns {Promise<ProductItem[]>}
  */
 async function getProductItems(page) {
-  const result = await page.$$eval("#srp-river-results li", (nodes) => {
+  const result = await page.$$eval("#srp-river-results li[id]", (nodes) => {
     return nodes.map((node) => {
       const detailLink = node.querySelector("a").href;
       const productId = new URL(detailLink).pathname.replace("/itm/", "");
@@ -311,6 +311,7 @@ async function crawlAndExtract(aiSDK, page, startUrl, query) {
   }
 
   console.log(`Data successfully extracted.`);
+  console.log(JSON.stringify(allProductData));
   return allProductData;
 }
 
