@@ -1,14 +1,11 @@
 {
   "name": "crawl-crawl",
   "version": "1.0.0",
-  "description": "",
   "type": "module",
   "scripts": {
     "start": "node --env-file ./.env src/index.mjs"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
   "packageManager": "pnpm@10.11.1",
   "dependencies": {
     "openai": "5.12.0",
