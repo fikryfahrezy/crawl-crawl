@@ -128,3 +128,8 @@ Create `.env` file like in the [Project Setup section](#project-setup), then run
 ```bash
 docker compose up --build --remove-orphans
 ```
+
+# Demo
+
+- [Demo video on YouTube](https://youtu.be/54bgTttNWJQ)
+- [Demo video on Google Drive](https://drive.google.com/file/d/1mozQ2dSXsJuN34mAz_jO0fPz-CH03Wdf/view)
